@@ -8,12 +8,17 @@ import sys
 from uuid import uuid4
 
 from .config import load_config, validate_environment
-from .domain import ResearchSession
+from .domain import ResearchSession, SessionState
+from .domain.models import utc_now
 from .persistence import SessionStore, WorkspaceLayout
-from .shell.app import render_startup_summary
+from .session import ResumeManager
+from .shell.app import render_session_status, render_startup_summary
 
 
-def build_parser() -> argparse.ArgumentParser:
+ROOT_COMMANDS = {"resume", "status", "pause"}
+
+
+def build_root_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="rh", description="ResearchHarness bootstrap CLI")
     parser.add_argument("goal", nargs="?", help="Optional research goal to bootstrap a session.")
     parser.add_argument(
@@ -27,11 +32,195 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Validate the local environment and print a diagnostic report.",
     )
+    parser.add_argument("--focus", help="Persist an initial or updated focus summary.")
+    parser.add_argument(
+        "--plan-item",
+        action="append",
+        default=[],
+        help="Persist a plan item. May be provided multiple times.",
+    )
+    parser.add_argument("--task-id", help="Persist the active task pointer.")
     return parser
 
 
+def build_command_parser(command_name: str) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog=f"rh {command_name}")
+    parser.add_argument("--workspace", type=Path, default=None)
+    parser.add_argument("--session-id", help="Specific session id to operate on.")
+    if command_name in {"resume", "pause"}:
+        parser.add_argument("--focus", help="Updated focus summary.")
+        parser.add_argument(
+            "--plan-item",
+            action="append",
+            default=[],
+            help="Persist a plan item. May be provided multiple times.",
+        )
+        parser.add_argument("--task-id", help="Persist the active task pointer.")
+    return parser
+
+
+def parse_args(argv: list[str] | None) -> tuple[str, argparse.Namespace]:
+    raw_args = list(sys.argv[1:] if argv is None else argv)
+    if raw_args and raw_args[0] in ROOT_COMMANDS:
+        command_name = raw_args[0]
+        return command_name, build_command_parser(command_name).parse_args(raw_args[1:])
+    return "root", build_root_parser().parse_args(raw_args)
+
+
+def _apply_session_updates(
+    session: ResearchSession,
+    *,
+    focus: str | None = None,
+    plan_items: list[str] | None = None,
+    task_id: str | None = None,
+) -> ResearchSession:
+    if focus is not None:
+        session.current_focus = focus
+    if plan_items:
+        session.plan_items = list(plan_items)
+    if task_id is not None:
+        session.active_task_id = task_id
+    session.updated_at = utc_now()
+    return session
+
+
+def _handle_doctor(
+    config, report, layout: WorkspaceLayout, session_id: str | None = None
+) -> int:
+    print(render_startup_summary(config, report, layout, session_id))
+    if report.issues:
+        print("issues:")
+        for issue in report.issues:
+            print(f"- {issue}")
+    return 0
+
+
+def _handle_root(args: argparse.Namespace, store: SessionStore, config, report, layout) -> int:
+    if args.doctor:
+        return _handle_doctor(config, report, layout)
+
+    if args.goal:
+        session_id = str(uuid4())
+        session = ResearchSession(
+            id=session_id,
+            goal=args.goal,
+            workspace_root=str(config.workspace_root),
+            transcript_path=str(layout.transcript_path(session_id)),
+        )
+        _apply_session_updates(
+            session,
+            focus=args.focus,
+            plan_items=args.plan_item,
+            task_id=args.task_id,
+        )
+        store.save(session)
+        store.append_transcript_entry(
+            session.id,
+            event="session_started",
+            message=f"Started session for goal: {session.goal}",
+        )
+        store.mark_command_start(session, "rh")
+        store.mark_command_end(session, "rh", safe_boundary="Session bootstrap persisted")
+        print(render_startup_summary(config, report, layout, session.id))
+        print(render_session_status(session, store.load_transcript(session.id)))
+        return 0
+
+    latest = store.load_latest()
+    if latest is None:
+        print(render_startup_summary(config, report, layout))
+        return 0
+
+    manager = ResumeManager(store)
+    result = manager.resume()
+    if result.session is None:
+        print("No resumable session found.", file=sys.stderr)
+        return 1
+    session = result.session
+    store.mark_command_start(session, "rh")
+    store.append_transcript_entry(
+        session.id,
+        event="session_resumed",
+        message="Resumed latest session via `rh`.",
+    )
+    store.mark_command_end(session, "rh", safe_boundary="Resume snapshot persisted")
+    print(render_session_status(session, store.load_transcript(session.id), recovery_summary=result.recovery_summary))
+    return 0
+
+
+def _handle_resume(args: argparse.Namespace, store: SessionStore) -> int:
+    manager = ResumeManager(store)
+    result = manager.resume(session_id=args.session_id)
+    if result.session is None:
+        print("No resumable session found.", file=sys.stderr)
+        return 1
+
+    session = result.session
+    store.mark_command_start(session, "resume")
+    _apply_session_updates(
+        session,
+        focus=args.focus,
+        plan_items=args.plan_item,
+        task_id=args.task_id,
+    )
+    session.state = SessionState.ACTIVE
+    store.save(session)
+    store.append_transcript_entry(
+        session.id,
+        event="session_resumed",
+        message="Session resumed.",
+    )
+    store.mark_command_end(session, "resume", safe_boundary="Resume snapshot persisted")
+    print(render_session_status(session, store.load_transcript(session.id), recovery_summary=result.recovery_summary))
+    return 0
+
+
+def _handle_status(args: argparse.Namespace, store: SessionStore) -> int:
+    session = store.load(args.session_id) if args.session_id else store.load_latest()
+    if session is None:
+        print("No saved sessions found.", file=sys.stderr)
+        return 1
+    status = store.latest_status() if not args.session_id else {
+        "session": session,
+        "transcript_entries": store.load_transcript(session.id),
+        "recovery": dict(session.metadata.get("recovery", {})),
+    }
+    print(
+        render_session_status(
+            status["session"],
+            status["transcript_entries"],
+            recovery_summary=status["recovery"].get("summary"),
+        )
+    )
+    return 0
+
+
+def _handle_pause(args: argparse.Namespace, store: SessionStore) -> int:
+    session = store.load(args.session_id) if args.session_id else store.load_latest()
+    if session is None:
+        print("No session available to pause.", file=sys.stderr)
+        return 1
+    store.mark_command_start(session, "pause")
+    _apply_session_updates(
+        session,
+        focus=args.focus,
+        plan_items=args.plan_item,
+        task_id=args.task_id,
+    )
+    store.mark_safe_boundary(session, "Pause requested by user")
+    store.append_transcript_entry(
+        session.id,
+        event="session_paused",
+        message="Session paused at a safe boundary.",
+    )
+    session.state = SessionState.PAUSED
+    store.save(session)
+    store.mark_command_end(session, "pause", safe_boundary="Session paused safely")
+    print(render_session_status(session, store.load_transcript(session.id)))
+    return 0
+
+
 def run(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    command_name, args = parse_args(argv)
     config = load_config(args.workspace)
     report = validate_environment(config)
 
@@ -41,30 +230,18 @@ def run(argv: list[str] | None = None) -> int:
         return 1
 
     layout = WorkspaceLayout.from_workspace_root(config.workspace_root).ensure()
-    session_id: str | None = None
+    store = SessionStore(layout)
 
-    if args.goal:
-        session_id = str(uuid4())
-        store = SessionStore(layout)
-        store.save(
-            ResearchSession(
-                id=session_id,
-                goal=args.goal,
-                workspace_root=str(config.workspace_root),
-                transcript_path=str(layout.transcript_path(session_id)),
-            )
-        )
-
-    if args.doctor:
-        print(render_startup_summary(config, report, layout, session_id))
-        if report.issues:
-            print("issues:")
-            for issue in report.issues:
-                print(f"- {issue}")
-        return 0
-
-    print(render_startup_summary(config, report, layout, session_id))
-    return 0
+    if command_name == "root":
+        return _handle_root(args, store, config, report, layout)
+    if command_name == "resume":
+        return _handle_resume(args, store)
+    if command_name == "status":
+        return _handle_status(args, store)
+    if command_name == "pause":
+        return _handle_pause(args, store)
+    print(f"Unsupported command: {command_name}", file=sys.stderr)
+    return 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -73,4 +250,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
