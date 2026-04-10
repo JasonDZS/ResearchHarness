@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import sys
+from typing import TextIO
 from uuid import uuid4
 
 from .config import ResearchHarnessConfig, load_config, validate_environment
@@ -14,6 +15,7 @@ from .persistence import SessionStore, WorkspaceLayout
 from .session import ResumeManager
 from .shell.commands import ShellCommandRegistry
 from .shell.input_normalizer import combine_input_tokens, normalize_input
+from .shell.repl import create_shell
 from .shell.app import render_session_status, render_startup_summary
 
 
@@ -180,9 +182,22 @@ def _handle_root(
     config: ResearchHarnessConfig,
     report,
     layout: WorkspaceLayout,
+    *,
+    input_stream: TextIO | None = None,
+    output_stream: TextIO | None = None,
 ) -> int:
     if args.doctor:
         return _handle_doctor(config, report, layout)
+
+    if not args.input_parts:
+        return create_shell(
+            store=store,
+            config=config,
+            report=report,
+            layout=layout,
+            input_stream=input_stream,
+            output_stream=output_stream,
+        ).run()
 
     registry = ShellCommandRegistry()
     normalized = normalize_input(combine_input_tokens(args.input_parts))
@@ -293,7 +308,12 @@ def _handle_pause(args: argparse.Namespace, store: SessionStore) -> int:
     return 0
 
 
-def run(argv: list[str] | None = None) -> int:
+def run(
+    argv: list[str] | None = None,
+    *,
+    input_stream: TextIO | None = None,
+    output_stream: TextIO | None = None,
+) -> int:
     command_name, args = parse_args(argv)
     config = load_config(args.workspace)
     report = validate_environment(config)
@@ -307,7 +327,15 @@ def run(argv: list[str] | None = None) -> int:
     store = SessionStore(layout)
 
     if command_name == "root":
-        return _handle_root(args, store, config, report, layout)
+        return _handle_root(
+            args,
+            store,
+            config,
+            report,
+            layout,
+            input_stream=input_stream,
+            output_stream=output_stream,
+        )
     if command_name == "resume":
         return _handle_resume(args, store)
     if command_name == "status":
@@ -318,8 +346,13 @@ def run(argv: list[str] | None = None) -> int:
     return 1
 
 
-def main(argv: list[str] | None = None) -> int:
-    return run(argv)
+def main(
+    argv: list[str] | None = None,
+    *,
+    input_stream: TextIO | None = None,
+    output_stream: TextIO | None = None,
+) -> int:
+    return run(argv, input_stream=input_stream, output_stream=output_stream)
 
 
 if __name__ == "__main__":
