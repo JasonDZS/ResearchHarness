@@ -7,11 +7,13 @@ from pathlib import Path
 import sys
 from uuid import uuid4
 
-from .config import load_config, validate_environment
+from .config import ResearchHarnessConfig, load_config, validate_environment
 from .domain import ResearchSession, SessionState
 from .domain.models import utc_now
 from .persistence import SessionStore, WorkspaceLayout
 from .session import ResumeManager
+from .shell.commands import ShellCommandRegistry
+from .shell.input_normalizer import combine_input_tokens, normalize_input
 from .shell.app import render_session_status, render_startup_summary
 
 
@@ -20,7 +22,11 @@ ROOT_COMMANDS = {"resume", "status", "pause"}
 
 def build_root_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="rh", description="ResearchHarness bootstrap CLI")
-    parser.add_argument("goal", nargs="?", help="Optional research goal to bootstrap a session.")
+    parser.add_argument(
+        "input_parts",
+        nargs="*",
+        help="Natural-language input or a slash command such as /status.",
+    )
     parser.add_argument(
         "--workspace",
         type=Path,
@@ -95,35 +101,103 @@ def _handle_doctor(
     return 0
 
 
-def _handle_root(args: argparse.Namespace, store: SessionStore, config, report, layout) -> int:
+def _start_new_session(
+    text: str,
+    args: argparse.Namespace,
+    store: SessionStore,
+    config: ResearchHarnessConfig,
+    report,
+    layout: WorkspaceLayout,
+) -> int:
+    session_id = str(uuid4())
+    session = ResearchSession(
+        id=session_id,
+        goal=text,
+        workspace_root=str(config.workspace_root),
+        transcript_path=str(layout.transcript_path(session_id)),
+    )
+    _apply_session_updates(
+        session,
+        focus=args.focus,
+        plan_items=args.plan_item,
+        task_id=args.task_id,
+    )
+    store.save(session)
+    store.append_transcript_entry(
+        session.id,
+        event="session_started",
+        message=f"Started session for goal: {session.goal}",
+    )
+    store.mark_command_start(session, "rh")
+    store.mark_command_end(session, "rh", safe_boundary="Session bootstrap persisted")
+    print(render_startup_summary(config, report, layout, session.id))
+    print(render_session_status(session, store.load_transcript(session.id)))
+    return 0
+
+
+def _record_natural_language_turn(
+    session: ResearchSession,
+    text: str,
+    store: SessionStore,
+) -> int:
+    store.mark_command_start(session, "user_turn")
+    session.state = SessionState.ACTIVE
+    store.save(session)
+    store.append_transcript_entry(
+        session.id,
+        event="user_message",
+        message=text,
+    )
+    store.mark_command_end(session, "user_turn", safe_boundary="User turn persisted")
+    print("Recorded natural-language request in the active session.")
+    print(render_session_status(session, store.load_transcript(session.id)))
+    return 0
+
+
+def _execute_shell_command(
+    registry: ShellCommandRegistry,
+    command_name: str,
+    command_args: list[str],
+    store: SessionStore,
+) -> int:
+    if not registry.has(command_name):
+        print(f"Unknown shell command: /{command_name}", file=sys.stderr)
+        return 1
+
+    session = None if command_name == "help" else store.load_latest()
+    if command_name != "help" and session is None:
+        print("No active session available for shell commands.", file=sys.stderr)
+        return 1
+
+    output = registry.execute(command_name, session, store if session is not None else None, command_args)
+    print(output)
+    return 0
+
+
+def _handle_root(
+    args: argparse.Namespace,
+    store: SessionStore,
+    config: ResearchHarnessConfig,
+    report,
+    layout: WorkspaceLayout,
+) -> int:
     if args.doctor:
         return _handle_doctor(config, report, layout)
 
-    if args.goal:
-        session_id = str(uuid4())
-        session = ResearchSession(
-            id=session_id,
-            goal=args.goal,
-            workspace_root=str(config.workspace_root),
-            transcript_path=str(layout.transcript_path(session_id)),
+    registry = ShellCommandRegistry()
+    normalized = normalize_input(combine_input_tokens(args.input_parts))
+    if normalized.kind == "shell_command":
+        return _execute_shell_command(
+            registry,
+            normalized.command_name or "",
+            normalized.command_args,
+            store,
         )
-        _apply_session_updates(
-            session,
-            focus=args.focus,
-            plan_items=args.plan_item,
-            task_id=args.task_id,
-        )
-        store.save(session)
-        store.append_transcript_entry(
-            session.id,
-            event="session_started",
-            message=f"Started session for goal: {session.goal}",
-        )
-        store.mark_command_start(session, "rh")
-        store.mark_command_end(session, "rh", safe_boundary="Session bootstrap persisted")
-        print(render_startup_summary(config, report, layout, session.id))
-        print(render_session_status(session, store.load_transcript(session.id)))
-        return 0
+    if normalized.kind == "natural_language" and normalized.text:
+        latest = store.load_latest()
+        if latest is None:
+            return _start_new_session(normalized.text, args, store, config, report, layout)
+        return _record_natural_language_turn(latest, normalized.text, store)
 
     latest = store.load_latest()
     if latest is None:
