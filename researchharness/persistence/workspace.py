@@ -21,6 +21,7 @@ class WorkspaceLayout:
 
     @classmethod
     def from_workspace_root(cls, workspace_root: Path, research_dir_name: str = ".research") -> "WorkspaceLayout":
+        workspace_root = workspace_root.expanduser().resolve()
         research_root = workspace_root / research_dir_name
         session_root = research_root / "session"
         return cls(

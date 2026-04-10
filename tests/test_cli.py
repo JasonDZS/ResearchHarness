@@ -38,8 +38,29 @@ class CliSmokeTests(unittest.TestCase):
             output = buffer.getvalue()
             self.assertEqual(exit_code, 0)
             self.assertIn("session_id:", output)
+            self.assertIn("state: active", output)
             sessions_dir = Path(tmp_dir) / ".research" / "session" / "sessions"
             self.assertEqual(len(list(sessions_dir.glob("*.json"))), 1)
+
+    def test_cli_status_reports_latest_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            main(
+                [
+                    "--workspace",
+                    tmp_dir,
+                    "--focus",
+                    "Track system state",
+                    "Summarize decoding papers",
+                ]
+            )
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                exit_code = main(["status", "--workspace", tmp_dir])
+
+            output = buffer.getvalue()
+            self.assertEqual(exit_code, 0)
+            self.assertIn("goal: Summarize decoding papers", output)
+            self.assertIn("current_focus: Track system state", output)
 
 
 if __name__ == "__main__":
