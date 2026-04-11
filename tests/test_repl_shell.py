@@ -78,6 +78,23 @@ class ReplShellTests(unittest.TestCase):
             assert session is not None
             self.assertEqual(session.state.value, "paused")
 
+    def test_repl_task_commands_refresh_session_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output = io.StringIO()
+            exit_code = main(
+                ["--workspace", tmp_dir],
+                input_stream=io.StringIO(
+                    "Investigate prompt caching\n/task add Collect papers\n/task focus task-1\n/tasks\n/exit\n"
+                ),
+                output_stream=output,
+            )
+            self.assertEqual(exit_code, 0)
+            rendered = output.getvalue()
+            self.assertIn("Added task task-1: Collect papers", rendered)
+            self.assertIn("Focused task task-1: Collect papers", rendered)
+            self.assertIn("[in_progress] Collect papers (task-1)", rendered)
+            self.assertIn("active=yes", rendered)
+
     def test_repl_bootstrap_recovers_existing_interrupted_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             main(["--workspace", tmp_dir, "Investigate retrieval-augmented decoding"])

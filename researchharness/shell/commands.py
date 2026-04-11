@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from uuid import uuid4
 
 from ..domain import Checkpoint, ResearchSession
-from ..persistence import SessionStore
+from ..persistence import SessionStore, TaskStore
+from ..session import TaskPlanner
 from .app import (
     render_checkpoints_view,
     render_command_help,
@@ -36,6 +37,11 @@ class ShellCommandRegistry:
             ),
             "plan": ShellCommand("plan", "/plan", "Show the persisted plan snapshot."),
             "tasks": ShellCommand("tasks", "/tasks", "Show persisted tasks."),
+            "task": ShellCommand(
+                "task",
+                "/task <add|focus> ...",
+                "Add a task or focus a persisted task.",
+            ),
             "checkpoint": ShellCommand(
                 "checkpoint",
                 "/checkpoint [summary]",
@@ -69,6 +75,8 @@ class ShellCommandRegistry:
             return render_plan_view(session)
         if name == "tasks":
             return render_tasks_view(session)
+        if name == "task":
+            return self._handle_task_command(session, store, args)
         if name == "checkpoint":
             if args:
                 checkpoint = Checkpoint(
@@ -86,3 +94,29 @@ class ShellCommandRegistry:
             return render_checkpoints_view(session)
         raise ValueError(f"Unknown shell command: {name}")
 
+    @staticmethod
+    def _handle_task_command(
+        session: ResearchSession,
+        store: SessionStore,
+        args: list[str],
+    ) -> str:
+        if not args:
+            return "Usage: /task <add|focus> ..."
+
+        planner = TaskPlanner(TaskStore(store))
+        action = args[0]
+        if action == "add":
+            if len(args) < 2:
+                return "Usage: /task add <text>"
+            task = planner.add_task(session.id, " ".join(args[1:]))
+            refreshed = store.load(session.id)
+            return f"Added task {task.id}: {task.title}\n{render_tasks_view(refreshed)}"
+
+        if action == "focus":
+            if len(args) != 2:
+                return "Usage: /task focus <id>"
+            task = planner.focus_task(session.id, args[1])
+            refreshed = store.load(session.id)
+            return f"Focused task {task.id}: {task.title}\n{render_session_status(refreshed, store.load_transcript(session.id))}"
+
+        return f"Unknown task command: {action}"

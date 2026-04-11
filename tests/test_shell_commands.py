@@ -38,6 +38,7 @@ class ShellCommandRegistryTests(unittest.TestCase):
         self.assertIn("/status", output)
         self.assertIn("/plan", output)
         self.assertIn("/tasks", output)
+        self.assertIn("/task <add|focus> ...", output)
         self.assertIn("/checkpoint", output)
 
 
@@ -109,6 +110,38 @@ class ShellCommandSmokeTests(unittest.TestCase):
                 exit_code = main(["--workspace", tmp_dir, "/checkpoint", "Save", "progress"])
             self.assertEqual(exit_code, 0)
             self.assertIn("Save progress", output.getvalue())
+
+    def test_task_commands_can_add_and_focus_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            main(["--workspace", tmp_dir, "Investigate prompt caching"])
+
+            add_output = io.StringIO()
+            with redirect_stdout(add_output):
+                add_code = main(["--workspace", tmp_dir, "/task", "add", "Collect", "papers"])
+            self.assertEqual(add_code, 0)
+            self.assertIn("Added task task-1: Collect papers", add_output.getvalue())
+
+            focus_output = io.StringIO()
+            with redirect_stdout(focus_output):
+                focus_code = main(["--workspace", tmp_dir, "/task", "focus", "task-1"])
+            self.assertEqual(focus_code, 0)
+            rendered = focus_output.getvalue()
+            self.assertIn("Focused task task-1: Collect papers", rendered)
+            self.assertIn("active_task: Collect papers (task-1)", rendered)
+
+            tasks_output = io.StringIO()
+            with redirect_stdout(tasks_output):
+                tasks_code = main(["--workspace", tmp_dir, "/tasks"])
+            self.assertEqual(tasks_code, 0)
+            self.assertIn("artifacts=-", tasks_output.getvalue())
+            self.assertIn("active=yes", tasks_output.getvalue())
+
+            layout = WorkspaceLayout.from_workspace_root(Path(tmp_dir)).ensure()
+            session = SessionStore(layout).load_latest()
+            self.assertIsNotNone(session)
+            assert session is not None
+            self.assertEqual(session.active_task_id, "task-1")
+            self.assertEqual(session.tasks[0].status, TaskStatus.IN_PROGRESS)
 
     def test_natural_language_input_continues_existing_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

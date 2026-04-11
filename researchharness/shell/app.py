@@ -96,8 +96,10 @@ def render_tasks_view(session: ResearchSession) -> str:
         return "No tasks yet."
     lines = ["Tasks:"]
     for task in session.tasks:
+        active_marker = " active=yes" if task.id == session.active_task_id else ""
+        artifact_refs = ",".join(task.artifact_refs) if task.artifact_refs else "-"
         lines.append(
-            f"- [{task.status.value}] {task.title} ({task.id}) workstream={task.workstream.value} priority={task.priority}"
+            f"- [{task.status.value}] {task.title} ({task.id}) workstream={task.workstream.value} priority={task.priority} artifacts={artifact_refs}{active_marker}"
         )
     return "\n".join(lines)
 

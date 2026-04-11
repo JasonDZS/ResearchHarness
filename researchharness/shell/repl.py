@@ -125,12 +125,17 @@ class ResearchShell:
             self._write("No active session available for shell commands.")
             return 1
 
+        if self.session is not None:
+            self.session = self.store.load(self.session.id)
+
         output = self.registry.execute(
             command_name,
             self.session,
             self.store if self.session is not None else None,
             command_args,
         )
+        if self.session is not None:
+            self.session = self.store.load(self.session.id)
         self._write(output)
         return 0
 

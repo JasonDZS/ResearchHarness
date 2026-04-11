@@ -8,7 +8,8 @@ from pathlib import Path
 
 from researchharness.cli import main
 from researchharness.persistence import SessionStore, WorkspaceLayout
-from researchharness.session import ResumeManager
+from researchharness.session import ResumeManager, TaskPlanner
+from researchharness.persistence import TaskStore
 
 
 class SessionResumeTests(unittest.TestCase):
@@ -102,6 +103,34 @@ class SessionResumeTests(unittest.TestCase):
             )
             transcript = store.load_transcript(resumed_session.id)
             self.assertEqual(transcript[-1].event, "session_recovered")
+
+    def test_tasks_survive_pause_and_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            main(["--workspace", tmp_dir, "Map recent work on KV-cache compression"])
+
+            layout = WorkspaceLayout.from_workspace_root(workspace).ensure()
+            store = SessionStore(layout)
+            session = store.load_latest()
+            self.assertIsNotNone(session)
+            assert session is not None
+
+            planner = TaskPlanner(TaskStore(store))
+            task = planner.add_task(session.id, "Collect literature", priority=2)
+            planner.focus_task(session.id, task.id)
+
+            pause_code = main(["pause", "--workspace", tmp_dir])
+            self.assertEqual(pause_code, 0)
+
+            resume_code = main(["resume", "--workspace", tmp_dir])
+            self.assertEqual(resume_code, 0)
+
+            resumed = store.load_latest()
+            self.assertIsNotNone(resumed)
+            assert resumed is not None
+            self.assertEqual(resumed.active_task_id, task.id)
+            self.assertEqual(resumed.tasks[0].title, "Collect literature")
+            self.assertEqual(resumed.tasks[0].status.value, "in_progress")
 
 
 if __name__ == "__main__":
